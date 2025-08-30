@@ -660,7 +660,7 @@ fn renderUI(state: *AppState, stdout: std.fs.File, allocator: std.mem.Allocator)
     if (state.mode == .animation) {
         try stdout.writeAll("Animation: [/]=prev/next frame, n=new frame, d=delete frame, p=play/pause, -/+=speed\n");
     } else {
-        try stdout.writeAll("Controls: hjkl/arrows=move, space=draw, m=mode, c=color, s=save, S=save C array, L=load, C=clear, q=quit\n");
+        try stdout.writeAll("Controls: hjkl/arrows=move, space=draw, m=mode, x=color, s=save, S=save C array, L=load, C=clear, q=quit\n");
     }
 
     if (state.mode == .line and state.line_start_x != null) {
