@@ -1,4 +1,4 @@
-# Bitmap Paint Tool
+# Zigrid -> Bitmap Paint Tool
 
 A CUI (Character User Interface) paint tool written in Zig that allows you to create and animate bitmap graphics in the terminal.
 
@@ -25,7 +25,7 @@ zig build
 ## Usage
 
 ```bash
-./zig-out/bin/bitmap_paint [options]
+./zig-out/bin/zigrid [options]
 ```
 
 ### Options
