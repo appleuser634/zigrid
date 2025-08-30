@@ -5,7 +5,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const exe = b.addExecutable(.{
-        .name = "bitmap_paint",
+        .name = "zigrid",
         .root_module = b.createModule(.{
             .root_source_file = b.path("main.zig"),
             .target = target,
