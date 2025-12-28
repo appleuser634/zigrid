@@ -383,6 +383,7 @@ const Mode = enum {
 };
 
 const MAX_FRAMES = 16;
+const MAX_HISTORY = 32;
 
 const AnimationState = struct {
     frames: []Canvas,
@@ -481,6 +482,174 @@ const AnimationState = struct {
         , .{ self.frames[0].width, self.frames[0].height, self.frame_count, bytes_per_frame });
         try file.writeAll(constants);
     }
+
+    fn writeFrameCArray(frame: *const Canvas, file: std.fs.File) !void {
+        var written_bytes: usize = 0;
+        var first_byte = true;
+
+        for (frame.pixels) |row| {
+            var x: usize = 0;
+            while (x < frame.width) {
+                var byte: u8 = 0;
+                var bit_count: usize = 0;
+
+                while (bit_count < 8 and x < frame.width) : ({
+                    x += 1;
+                    bit_count += 1;
+                }) {
+                    if (row[x] == .black) {
+                        byte |= @as(u8, 1) << @intCast(7 - bit_count);
+                    }
+                }
+
+                if (!first_byte) {
+                    try file.writeAll(", ");
+                    if (written_bytes % 12 == 0) {
+                        try file.writeAll("\n    ");
+                    }
+                } else {
+                    try file.writeAll("    ");
+                    first_byte = false;
+                }
+
+                var buf: [16]u8 = undefined;
+                const byte_str = try std.fmt.bufPrint(&buf, "0x{x:0>2}", .{byte});
+                try file.writeAll(byte_str);
+
+                written_bytes += 1;
+            }
+        }
+        try file.writeAll("\n};\n\n");
+    }
+
+    fn saveFrameHeader(self: AnimationState, filename: []const u8) !void {
+        const file = try std.fs.cwd().createFile(filename, .{});
+        defer file.close();
+
+        var header_buf: [256]u8 = undefined;
+        const header = try std.fmt.bufPrint(&header_buf, "// Frames: {d}, Size: {d}x{d}\n\n", .{
+            self.frame_count,
+            self.frames[0].width,
+            self.frames[0].height,
+        });
+        try file.writeAll(header);
+
+        for (0..self.frame_count) |frame_idx| {
+            const frame = &self.frames[frame_idx];
+            var name_buf: [32]u8 = undefined;
+            const frame_name = try std.fmt.bufPrint(&name_buf, "frame_{d:0>2}", .{frame_idx + 1});
+
+            try file.writeAll("const unsigned char ");
+            try file.writeAll(frame_name);
+            try file.writeAll("[] PROGMEM = {\n");
+            try writeFrameCArray(frame, file);
+        }
+
+        try file.writeAll("const unsigned char* const animation_frames[] PROGMEM = {\n");
+        for (0..self.frame_count) |frame_idx| {
+            var name_buf: [32]u8 = undefined;
+            const frame_name = try std.fmt.bufPrint(&name_buf, "frame_{d:0>2}", .{frame_idx + 1});
+            try file.writeAll("    ");
+            try file.writeAll(frame_name);
+            if (frame_idx + 1 < self.frame_count) {
+                try file.writeAll(",\n");
+            } else {
+                try file.writeAll("\n");
+            }
+        }
+        try file.writeAll("};\n");
+
+        const bytes_per_row = (self.frames[0].width + 7) / 8;
+        const bytes_per_frame = bytes_per_row * self.frames[0].height;
+
+        var const_buf: [512]u8 = undefined;
+        const constants = try std.fmt.bufPrint(&const_buf,
+            \\
+            \\const unsigned int FRAME_WIDTH = {d};
+            \\const unsigned int FRAME_HEIGHT = {d};
+            \\const unsigned int FRAME_COUNT = {d};
+            \\const unsigned int BYTES_PER_FRAME = {d};
+            \\
+        , .{ self.frames[0].width, self.frames[0].height, self.frame_count, bytes_per_frame });
+        try file.writeAll(constants);
+    }
+
+    fn saveAnimation(self: AnimationState, filename: []const u8) !void {
+        const file = try std.fs.cwd().createFile(filename, .{});
+        defer file.close();
+
+        var header_buf: [128]u8 = undefined;
+        const header = try std.fmt.bufPrint(&header_buf, "ANIM {d} {d} {d}\n", .{
+            self.frames[0].width,
+            self.frames[0].height,
+            self.frame_count,
+        });
+        try file.writeAll(header);
+
+        var line_buf: [MAX_WIDTH + 1]u8 = undefined;
+        for (0..self.frame_count) |frame_idx| {
+            var frame_header_buf: [32]u8 = undefined;
+            const frame_header = try std.fmt.bufPrint(&frame_header_buf, "FRAME {d}\n", .{frame_idx + 1});
+            try file.writeAll(frame_header);
+
+            const frame = &self.frames[frame_idx];
+            for (frame.pixels) |row| {
+                for (row, 0..) |pixel, x| {
+                    line_buf[x] = if (pixel == .black) '0' else '1';
+                }
+                try file.writeAll(line_buf[0..frame.width]);
+                try file.writeAll("\n");
+            }
+        }
+    }
+
+    fn loadAnimation(self: *AnimationState, allocator: std.mem.Allocator, filename: []const u8) !void {
+        const file = try std.fs.cwd().openFile(filename, .{});
+        defer file.close();
+
+        const file_size = try file.getEndPos();
+        const contents = try allocator.alloc(u8, file_size);
+        defer allocator.free(contents);
+        _ = try file.read(contents);
+
+        var it = std.mem.tokenizeSequence(u8, contents, "\n");
+        const header = it.next() orelse return error.InvalidFormat;
+        var header_it = std.mem.tokenizeSequence(u8, header, " ");
+        const magic = header_it.next() orelse return error.InvalidFormat;
+        if (!std.mem.eql(u8, magic, "ANIM")) return error.InvalidFormat;
+
+        const width = try std.fmt.parseInt(usize, header_it.next() orelse return error.InvalidFormat, 10);
+        const height = try std.fmt.parseInt(usize, header_it.next() orelse return error.InvalidFormat, 10);
+        const frame_count = try std.fmt.parseInt(usize, header_it.next() orelse return error.InvalidFormat, 10);
+
+        if (frame_count == 0 or frame_count > MAX_FRAMES) return error.InvalidFormat;
+        if (width > MAX_WIDTH or height > MAX_HEIGHT) return error.CanvasTooLarge;
+
+        self.frame_count = frame_count;
+        self.current_frame = 0;
+        self.playing = false;
+
+        var frame_idx: usize = 0;
+        while (frame_idx < frame_count) : (frame_idx += 1) {
+            const frame_header = it.next() orelse return error.InvalidFormat;
+            if (!std.mem.startsWith(u8, frame_header, "FRAME")) return error.InvalidFormat;
+
+            var canvas = try Canvas.init(allocator, width, height);
+            errdefer canvas.deinit();
+
+            var y: usize = 0;
+            while (y < height) : (y += 1) {
+                const line = it.next() orelse return error.InvalidFormat;
+                for (line, 0..) |char, x| {
+                    if (x < width and (char == '0' or char == '1')) {
+                        canvas.pixels[y][x] = @enumFromInt(char - '0');
+                    }
+                }
+            }
+
+            self.frames[frame_idx] = canvas;
+        }
+    }
 };
 
 const AppState = struct {
@@ -495,6 +664,10 @@ const AppState = struct {
     rect_start_y: ?usize = null,
     original_termios: std.posix.termios,
     animation: AnimationState,
+    undo_stack: []Canvas,
+    undo_count: usize = 0,
+    redo_stack: []Canvas,
+    redo_count: usize = 0,
 };
 
 pub fn main() !void {
@@ -541,6 +714,11 @@ pub fn main() !void {
     var animation = try AnimationState.init(allocator);
     defer animation.deinit(allocator);
 
+    const undo_stack = try allocator.alloc(Canvas, MAX_HISTORY);
+    const redo_stack = try allocator.alloc(Canvas, MAX_HISTORY);
+    defer allocator.free(undo_stack);
+    defer allocator.free(redo_stack);
+
     const stdout_file = std.fs.File{ .handle = std.posix.STDOUT_FILENO };
     const stdin = std.fs.File{ .handle = std.posix.STDIN_FILENO };
 
@@ -560,11 +738,21 @@ pub fn main() !void {
         .canvas = canvas,
         .original_termios = termios,
         .animation = animation,
+        .undo_stack = undo_stack,
+        .redo_stack = redo_stack,
     };
 
     defer {
         for (0..state.animation.frame_count) |frame_idx| {
             state.animation.frames[frame_idx].deinit();
+        }
+        var idx: usize = 0;
+        while (idx < state.undo_count) : (idx += 1) {
+            state.undo_stack[idx].deinit();
+        }
+        idx = 0;
+        while (idx < state.redo_count) : (idx += 1) {
+            state.redo_stack[idx].deinit();
         }
     }
 
@@ -597,6 +785,7 @@ pub fn main() !void {
                 // Load next frame
                 state.canvas.deinit();
                 state.canvas = try state.animation.frames[state.animation.current_frame].copy(allocator);
+                clearHistory(&state);
 
                 last_frame_time = current_time;
                 continue; // Skip input handling during playback
@@ -658,9 +847,9 @@ fn renderUI(state: *AppState, stdout: std.fs.File, allocator: std.mem.Allocator)
 
     // Help text
     if (state.mode == .animation) {
-        try stdout.writeAll("Animation: [/]=prev/next frame, n=new frame, d=delete frame, p=play/pause, -/+=speed\n");
+        try stdout.writeAll("Animation: [/]=prev/next frame, n=new frame, d=delete frame, y=duplicate frame, p=play/pause, -/+=speed, a=save anim, o=load anim, A=save frame header\n");
     } else {
-        try stdout.writeAll("Controls: hjkl/arrows=move, space=draw, m=mode, x=color, s=save, S=save C array, L=load, C=clear, q=quit\n");
+        try stdout.writeAll("Controls: hjkl/arrows=move, space=draw, u=undo, r=redo, m=mode, c=color, s=save, S=save C array, L=load, C=clear, q=quit\n");
     }
 
     if (state.mode == .line and state.line_start_x != null) {
@@ -714,6 +903,75 @@ fn readLine(stdin: std.fs.File, buf: []u8) !?[]u8 {
     return null;
 }
 
+fn clearRedo(state: *AppState) void {
+    var idx: usize = 0;
+    while (idx < state.redo_count) : (idx += 1) {
+        state.redo_stack[idx].deinit();
+    }
+    state.redo_count = 0;
+}
+
+fn pushUndoCopy(state: *AppState, allocator: std.mem.Allocator) !void {
+    if (state.undo_count == MAX_HISTORY) {
+        state.undo_stack[0].deinit();
+        var idx: usize = 0;
+        while (idx + 1 < state.undo_count) : (idx += 1) {
+            state.undo_stack[idx] = state.undo_stack[idx + 1];
+        }
+        state.undo_count -= 1;
+    }
+
+    state.undo_stack[state.undo_count] = try state.canvas.copy(allocator);
+    state.undo_count += 1;
+    clearRedo(state);
+}
+
+fn pushUndoMove(state: *AppState, canvas: Canvas) void {
+    if (state.undo_count == MAX_HISTORY) {
+        state.undo_stack[0].deinit();
+        var idx: usize = 0;
+        while (idx + 1 < state.undo_count) : (idx += 1) {
+            state.undo_stack[idx] = state.undo_stack[idx + 1];
+        }
+        state.undo_count -= 1;
+    }
+
+    state.undo_stack[state.undo_count] = canvas;
+    state.undo_count += 1;
+}
+
+fn pushRedoMove(state: *AppState, canvas: Canvas) void {
+    if (state.redo_count == MAX_HISTORY) {
+        state.redo_stack[0].deinit();
+        var idx: usize = 0;
+        while (idx + 1 < state.redo_count) : (idx += 1) {
+            state.redo_stack[idx] = state.redo_stack[idx + 1];
+        }
+        state.redo_count -= 1;
+    }
+
+    state.redo_stack[state.redo_count] = canvas;
+    state.redo_count += 1;
+}
+
+fn clearHistory(state: *AppState) void {
+    var idx: usize = 0;
+    while (idx < state.undo_count) : (idx += 1) {
+        state.undo_stack[idx].deinit();
+    }
+    state.undo_count = 0;
+    clearRedo(state);
+}
+
+fn clampCursor(state: *AppState) void {
+    if (state.cursor_x >= state.canvas.width) {
+        state.cursor_x = state.canvas.width - 1;
+    }
+    if (state.cursor_y >= state.canvas.height) {
+        state.cursor_y = state.canvas.height - 1;
+    }
+}
+
 fn handleInput(state: *AppState, key: u8, allocator: std.mem.Allocator, stdin: std.fs.File, stdout_file: std.fs.File) !void {
     // Handle escape sequences for arrow keys
     if (key == 0x1B) { // ESC
@@ -754,15 +1012,42 @@ fn handleInput(state: *AppState, key: u8, allocator: std.mem.Allocator, stdin: s
             if (state.cursor_x < state.canvas.width - 1) state.cursor_x += 1;
         },
 
+        // Undo/Redo
+        'u' => {
+            if (state.undo_count > 0) {
+                pushRedoMove(state, state.canvas);
+                state.canvas = state.undo_stack[state.undo_count - 1];
+                state.undo_count -= 1;
+                clampCursor(state);
+            }
+        },
+
+        'r' => {
+            if (state.redo_count > 0) {
+                pushUndoMove(state, state.canvas);
+                state.canvas = state.redo_stack[state.redo_count - 1];
+                state.redo_count -= 1;
+                clampCursor(state);
+            }
+        },
+
         // Drawing
         ' ' => {
             switch (state.mode) {
-                .pen => state.canvas.setPixel(state.cursor_x, state.cursor_y, state.color),
+                .pen => {
+                    if (state.canvas.getPixel(state.cursor_x, state.cursor_y)) |pixel| {
+                        if (pixel != state.color) {
+                            try pushUndoCopy(state, allocator);
+                            state.canvas.setPixel(state.cursor_x, state.cursor_y, state.color);
+                        }
+                    }
+                },
                 .line => {
                     if (state.line_start_x == null) {
                         state.line_start_x = state.cursor_x;
                         state.line_start_y = state.cursor_y;
                     } else {
+                        try pushUndoCopy(state, allocator);
                         state.canvas.drawLine(
                             @intCast(state.line_start_x.?),
                             @intCast(state.line_start_y.?),
@@ -783,13 +1068,28 @@ fn handleInput(state: *AppState, key: u8, allocator: std.mem.Allocator, stdin: s
                         const y = @min(state.rect_start_y.?, state.cursor_y);
                         const w = @abs(@as(isize, @intCast(state.cursor_x)) - @as(isize, @intCast(state.rect_start_x.?))) + 1;
                         const h = @abs(@as(isize, @intCast(state.cursor_y)) - @as(isize, @intCast(state.rect_start_y.?))) + 1;
+                        try pushUndoCopy(state, allocator);
                         state.canvas.drawRectangle(x, y, @intCast(w), @intCast(h), state.color, false);
                         state.rect_start_x = null;
                         state.rect_start_y = null;
                     }
                 },
-                .fill => try state.canvas.floodFill(state.cursor_x, state.cursor_y, state.color, allocator),
-                .animation => state.canvas.setPixel(state.cursor_x, state.cursor_y, state.color), // Allow drawing in animation mode
+                .fill => {
+                    if (state.canvas.getPixel(state.cursor_x, state.cursor_y)) |pixel| {
+                        if (pixel != state.color) {
+                            try pushUndoCopy(state, allocator);
+                            try state.canvas.floodFill(state.cursor_x, state.cursor_y, state.color, allocator);
+                        }
+                    }
+                },
+                .animation => {
+                    if (state.canvas.getPixel(state.cursor_x, state.cursor_y)) |pixel| {
+                        if (pixel != state.color) {
+                            try pushUndoCopy(state, allocator);
+                            state.canvas.setPixel(state.cursor_x, state.cursor_y, state.color);
+                        }
+                    }
+                }, // Allow drawing in animation mode
                 .quit => {},
             }
         },
@@ -800,6 +1100,7 @@ fn handleInput(state: *AppState, key: u8, allocator: std.mem.Allocator, stdin: s
                 const y = @min(state.rect_start_y.?, state.cursor_y);
                 const w = @abs(@as(isize, @intCast(state.cursor_x)) - @as(isize, @intCast(state.rect_start_x.?))) + 1;
                 const h = @abs(@as(isize, @intCast(state.cursor_y)) - @as(isize, @intCast(state.rect_start_y.?))) + 1;
+                try pushUndoCopy(state, allocator);
                 state.canvas.drawRectangle(x, y, @intCast(w), @intCast(h), state.color, true);
                 state.rect_start_x = null;
                 state.rect_start_y = null;
@@ -824,7 +1125,7 @@ fn handleInput(state: *AppState, key: u8, allocator: std.mem.Allocator, stdin: s
         },
 
         // Color switching
-        'x' => {
+        'c' => {
             state.color = switch (state.color) {
                 .black => .white,
                 .white => .black,
@@ -832,7 +1133,10 @@ fn handleInput(state: *AppState, key: u8, allocator: std.mem.Allocator, stdin: s
         },
 
         // Clear canvas
-        'C' => state.canvas.clear(),
+        'C' => {
+            try pushUndoCopy(state, allocator);
+            state.canvas.clear();
+        },
 
         // Save/Load
         's' => {
@@ -887,6 +1191,29 @@ fn handleInput(state: *AppState, key: u8, allocator: std.mem.Allocator, stdin: s
             }
         },
 
+        'A' => {
+            if (state.mode == .animation) {
+                // Save current frame first
+                state.animation.frames[state.animation.current_frame].deinit();
+                state.animation.frames[state.animation.current_frame] = try state.canvas.copy(allocator);
+
+                try stdout_file.writeAll("\nEnter header filename for frames: ");
+
+                const raw = try std.posix.tcgetattr(stdin.handle);
+                try std.posix.tcsetattr(stdin.handle, .NOW, state.original_termios);
+                defer std.posix.tcsetattr(stdin.handle, .NOW, raw) catch {};
+
+                var buf: [256]u8 = undefined;
+                if (try readLine(stdin, &buf)) |filename| {
+                    state.animation.saveFrameHeader(filename) catch |err| {
+                        var err_buf: [256]u8 = undefined;
+                        const err_str = try std.fmt.bufPrint(&err_buf, "Error saving frame header: {any}\n", .{err});
+                        try stdout_file.writeAll(err_str);
+                    };
+                }
+            }
+        },
+
         'L' => {
             try stdout_file.writeAll("\nEnter filename: ");
 
@@ -897,6 +1224,7 @@ fn handleInput(state: *AppState, key: u8, allocator: std.mem.Allocator, stdin: s
 
             var buf: [256]u8 = undefined;
             if (try readLine(stdin, &buf)) |filename| {
+                try pushUndoCopy(state, allocator);
                 const loaded = Canvas.load(allocator, filename) catch |err| {
                     var err_buf: [256]u8 = undefined;
                     const err_str = try std.fmt.bufPrint(&err_buf, "Error loading: {any}\n", .{err});
@@ -907,6 +1235,59 @@ fn handleInput(state: *AppState, key: u8, allocator: std.mem.Allocator, stdin: s
                 state.canvas = loaded;
                 state.cursor_x = 0;
                 state.cursor_y = 0;
+            }
+        },
+
+        'a' => {
+            if (state.mode == .animation) {
+                state.animation.frames[state.animation.current_frame].deinit();
+                state.animation.frames[state.animation.current_frame] = try state.canvas.copy(allocator);
+
+                try stdout_file.writeAll("\nEnter animation filename: ");
+
+                const raw = try std.posix.tcgetattr(stdin.handle);
+                try std.posix.tcsetattr(stdin.handle, .NOW, state.original_termios);
+                defer std.posix.tcsetattr(stdin.handle, .NOW, raw) catch {};
+
+                var buf: [256]u8 = undefined;
+                if (try readLine(stdin, &buf)) |filename| {
+                    state.animation.saveAnimation(filename) catch |err| {
+                        var err_buf: [256]u8 = undefined;
+                        const err_str = try std.fmt.bufPrint(&err_buf, "Error saving animation: {any}\n", .{err});
+                        try stdout_file.writeAll(err_str);
+                    };
+                }
+            }
+        },
+
+        'o' => {
+            if (state.mode == .animation) {
+                try stdout_file.writeAll("\nEnter animation filename: ");
+
+                const raw = try std.posix.tcgetattr(stdin.handle);
+                try std.posix.tcsetattr(stdin.handle, .NOW, state.original_termios);
+                defer std.posix.tcsetattr(stdin.handle, .NOW, raw) catch {};
+
+                var buf: [256]u8 = undefined;
+                if (try readLine(stdin, &buf)) |filename| {
+                    var idx: usize = 0;
+                    while (idx < state.animation.frame_count) : (idx += 1) {
+                        state.animation.frames[idx].deinit();
+                    }
+                    clearHistory(state);
+
+                    state.animation.loadAnimation(allocator, filename) catch |err| {
+                        var err_buf: [256]u8 = undefined;
+                        const err_str = try std.fmt.bufPrint(&err_buf, "Error loading animation: {any}\n", .{err});
+                        try stdout_file.writeAll(err_str);
+                        return;
+                    };
+
+                    state.canvas.deinit();
+                    state.canvas = try state.animation.frames[state.animation.current_frame].copy(allocator);
+                    state.cursor_x = 0;
+                    state.cursor_y = 0;
+                }
             }
         },
 
@@ -924,6 +1305,7 @@ fn handleInput(state: *AppState, key: u8, allocator: std.mem.Allocator, stdin: s
                 state.animation.current_frame -= 1;
                 state.canvas.deinit();
                 state.canvas = try state.animation.frames[state.animation.current_frame].copy(allocator);
+                clearHistory(state);
             }
         },
 
@@ -937,6 +1319,7 @@ fn handleInput(state: *AppState, key: u8, allocator: std.mem.Allocator, stdin: s
                 state.animation.current_frame += 1;
                 state.canvas.deinit();
                 state.canvas = try state.animation.frames[state.animation.current_frame].copy(allocator);
+                clearHistory(state);
             }
         },
 
@@ -954,19 +1337,48 @@ fn handleInput(state: *AppState, key: u8, allocator: std.mem.Allocator, stdin: s
                 // Switch to new frame
                 state.canvas.deinit();
                 state.canvas = try state.animation.frames[state.animation.current_frame].copy(allocator);
+                clearHistory(state);
             }
         },
 
-        'c' => {
+        'd' => {
+            if (state.mode == .animation and state.animation.frame_count > 1) {
+                const removed = state.animation.current_frame;
+                state.animation.frames[removed].deinit();
+
+                var idx = removed;
+                while (idx + 1 < state.animation.frame_count) : (idx += 1) {
+                    state.animation.frames[idx] = state.animation.frames[idx + 1];
+                }
+
+                state.animation.frame_count -= 1;
+                if (state.animation.current_frame >= state.animation.frame_count) {
+                    state.animation.current_frame = state.animation.frame_count - 1;
+                }
+
+                state.canvas.deinit();
+                state.canvas = try state.animation.frames[state.animation.current_frame].copy(allocator);
+            }
+        },
+
+        'y' => {
             if (state.mode == .animation and state.animation.frame_count < MAX_FRAMES) {
                 // Save current canvas to current frame
                 state.animation.frames[state.animation.current_frame].deinit();
                 state.animation.frames[state.animation.current_frame] = try state.canvas.copy(allocator);
 
-                // Create new frame
+                const insert_idx = state.animation.current_frame + 1;
+                var idx = state.animation.frame_count;
+                while (idx > insert_idx) : (idx -= 1) {
+                    state.animation.frames[idx] = state.animation.frames[idx - 1];
+                }
+
+                state.animation.frames[insert_idx] = try state.animation.frames[state.animation.current_frame].copy(allocator);
                 state.animation.frame_count += 1;
-                state.animation.current_frame = state.animation.frame_count - 1;
-                state.animation.frames[state.animation.current_frame] = try Canvas.init(allocator, state.canvas.width, state.canvas.height);
+                state.animation.current_frame = insert_idx;
+
+                state.canvas.deinit();
+                state.canvas = try state.animation.frames[state.animation.current_frame].copy(allocator);
             }
         },
 
@@ -991,4 +1403,3 @@ fn handleInput(state: *AppState, key: u8, allocator: std.mem.Allocator, stdin: s
         else => {},
     }
 }
-
