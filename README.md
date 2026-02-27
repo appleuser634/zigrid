@@ -13,8 +13,8 @@ A CUI (Character User Interface) paint tool written in Zig that allows you to cr
 - Animation mode with up to 16 frames
 - Save/load functionality
 - Export to C array format (PROGMEM) for embedded systems
-- Double-width pixels for better aspect ratio
-- Optimized rendering to reduce animation flicker
+- Block-cell rendering by default for ANSI-capable terminals
+- Optional Sixel rendering for pixel-accurate display via `--sixel`
 
 ## Building
 
@@ -32,6 +32,7 @@ zig build
 
 - `-w, --width <n>`: Set canvas width (max: 128)
 - `-h, --height <n>`: Set canvas height (max: 64)
+- `--sixel`: Use Sixel rendering instead of the default block rendering
 - `--help`: Show help message
 
 ### Controls
@@ -91,5 +92,6 @@ Exports as a C array suitable for embedded systems:
 ## Requirements
 
 - Zig 0.15.1 or later
-- A terminal that supports ANSI escape sequences
+- An ANSI-capable interactive terminal for the default block renderer
+- Sixel terminal support only when using `--sixel`
 - Must be run in an interactive terminal (not piped or redirected)

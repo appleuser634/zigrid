@@ -8,6 +8,11 @@ const Color = enum(u8) {
     white = 1,
 };
 
+const RenderMode = enum {
+    block,
+    sixel,
+};
+
 const Canvas = struct {
     width: usize,
     height: usize,
@@ -76,102 +81,114 @@ const Canvas = struct {
         }
     }
 
-    fn render(self: Canvas, stdout: std.fs.File) !void {
-        try stdout.writeAll("\x1B[2J\x1B[H"); // Clear screen and move cursor to top
-
-        // Top border
-        try stdout.writeAll("┌");
-        for (0..self.width * 2) |_| {
-            try stdout.writeAll("─");
-        }
-        try stdout.writeAll("┐\n");
-
-        // Canvas content
-        for (self.pixels) |row| {
-            try stdout.writeAll("│");
-            for (row) |pixel| {
-                const chars = switch (pixel) {
-                    .black => "██",
-                    .white => "  ",
-                };
-                try stdout.writeAll(chars);
-            }
-            try stdout.writeAll("│\n");
-        }
-
-        // Bottom border
-        try stdout.writeAll("└");
-        for (0..self.width * 2) |_| {
-            try stdout.writeAll("─");
-        }
-        try stdout.writeAll("┘\n");
+    fn appendBytes(buffer: []u8, idx: *usize, data: []const u8) void {
+        @memcpy(buffer[idx.* .. idx.* + data.len], data);
+        idx.* += data.len;
     }
 
-    fn renderOptimized(self: Canvas, stdout: std.fs.File, allocator: std.mem.Allocator) !void {
-        _ = allocator; // Not needed with fixed buffer
+    fn renderSixel(self: Canvas, stdout: std.fs.File, cursor_x: usize, cursor_y: usize) !void {
+        try stdout.writeAll("\x1B[2J\x1B[H"); // Clear screen and move cursor to top
 
-        // Use a fixed buffer for better performance
-        var buffer: [30000]u8 = undefined; // Large enough for max canvas with UTF-8
+        var buffer: [60000]u8 = undefined;
         var idx: usize = 0;
 
-        // Move cursor to top without clearing screen
-        const header = "\x1B[H";
-        @memcpy(buffer[idx .. idx + header.len], header);
-        idx += header.len;
+        const header = "\x1BPq";
+        appendBytes(buffer[0..], &idx, header);
+        appendBytes(buffer[0..], &idx, "#0;2;100;100;100"); // white
+        appendBytes(buffer[0..], &idx, "#1;2;0;0;0"); // black
+        appendBytes(buffer[0..], &idx, "#2;2;100;0;0"); // cursor (red)
 
-        // Top border
-        const top_left = "┌";
-        @memcpy(buffer[idx .. idx + top_left.len], top_left);
-        idx += top_left.len;
+        var y: usize = 0;
+        while (y < self.height) : (y += 6) {
+            const band_height = @min(@as(usize, 6), self.height - y);
+            const white_bits: u8 = @intCast((@as(u8, 1) << @intCast(band_height)) - 1);
 
-        for (0..self.width * 2) |_| {
-            const h_line = "─";
-            @memcpy(buffer[idx .. idx + h_line.len], h_line);
-            idx += h_line.len;
-        }
-
-        const top_right = "┐\n";
-        @memcpy(buffer[idx .. idx + top_right.len], top_right);
-        idx += top_right.len;
-
-        // Canvas content
-        for (self.pixels) |row| {
-            const v_line = "│";
-            @memcpy(buffer[idx .. idx + v_line.len], v_line);
-            idx += v_line.len;
-
-            for (row) |pixel| {
-                const chars = switch (pixel) {
-                    .black => "██",
-                    .white => "  ",
-                };
-                @memcpy(buffer[idx .. idx + chars.len], chars);
-                idx += chars.len;
+            appendBytes(buffer[0..], &idx, "#0");
+            var x: usize = 0;
+            while (x < self.width) : (x += 1) {
+                buffer[idx] = @intCast(0x3F + white_bits);
+                idx += 1;
             }
 
-            @memcpy(buffer[idx .. idx + v_line.len], v_line);
-            idx += v_line.len;
-            buffer[idx] = '\n';
-            idx += 1;
+            appendBytes(buffer[0..], &idx, "$");
+            appendBytes(buffer[0..], &idx, "#1");
+
+            x = 0;
+            while (x < self.width) : (x += 1) {
+                var bits: u8 = 0;
+                var bit_idx: usize = 0;
+                while (bit_idx < band_height) : (bit_idx += 1) {
+                    if (self.pixels[y + bit_idx][x] == .black) {
+                        bits |= @as(u8, 1) << @intCast(bit_idx);
+                    }
+                }
+                buffer[idx] = @intCast(0x3F + bits);
+                idx += 1;
+            }
+
+            if (cursor_y >= y and cursor_y < y + band_height) {
+                appendBytes(buffer[0..], &idx, "$");
+                appendBytes(buffer[0..], &idx, "#2");
+
+                x = 0;
+                while (x < self.width) : (x += 1) {
+                    const bits: u8 = if (x == cursor_x)
+                        @as(u8, 1) << @intCast(cursor_y - y)
+                    else
+                        0;
+                    buffer[idx] = @intCast(0x3F + bits);
+                    idx += 1;
+                }
+            }
+
+            if (y + 6 < self.height) {
+                appendBytes(buffer[0..], &idx, "-");
+            }
         }
 
-        // Bottom border
-        const bottom_left = "└";
-        @memcpy(buffer[idx .. idx + bottom_left.len], bottom_left);
-        idx += bottom_left.len;
-
-        for (0..self.width * 2) |_| {
-            const h_line = "─";
-            @memcpy(buffer[idx .. idx + h_line.len], h_line);
-            idx += h_line.len;
-        }
-
-        const bottom_right = "┘\n";
-        @memcpy(buffer[idx .. idx + bottom_right.len], bottom_right);
-        idx += bottom_right.len;
-
-        // Write entire buffer at once
+        appendBytes(buffer[0..], &idx, "\x1B\\");
         try stdout.writeAll(buffer[0..idx]);
+    }
+
+    fn renderBlock(self: Canvas, stdout: std.fs.File, cursor_x: usize, cursor_y: usize) !void {
+        try stdout.writeAll("\x1B[2J\x1B[H"); // Clear screen and move cursor to top
+
+        var line_buffer: [1024]u8 = undefined;
+        var idx: usize = 0;
+        appendBytes(line_buffer[0..], &idx, "┌");
+        for (0..self.width) |_| {
+            appendBytes(line_buffer[0..], &idx, "──");
+        }
+        appendBytes(line_buffer[0..], &idx, "┐\n");
+        try stdout.writeAll(line_buffer[0..idx]);
+
+        for (self.pixels, 0..) |row, y| {
+            idx = 0;
+            appendBytes(line_buffer[0..], &idx, "│");
+            for (row, 0..) |pixel, x| {
+                const cell = if (x == cursor_x and y == cursor_y)
+                    switch (pixel) {
+                        .black => "▓▓",
+                        .white => "▒▒",
+                    }
+                else
+                    switch (pixel) {
+                        .black => "██",
+                        .white => "  ",
+                    };
+                appendBytes(line_buffer[0..], &idx, cell);
+            }
+            appendBytes(line_buffer[0..], &idx, "│\n");
+            try stdout.writeAll(line_buffer[0..idx]);
+        }
+
+        idx = 0;
+        appendBytes(line_buffer[0..], &idx, "└");
+        for (0..self.width) |_| {
+            appendBytes(line_buffer[0..], &idx, "──");
+        }
+        appendBytes(line_buffer[0..], &idx, "┘\n");
+        try stdout.writeAll(line_buffer[0..idx]);
     }
 
     fn drawLine(self: *Canvas, x0: isize, y0: isize, x1: isize, y1: isize, color: Color) void {
@@ -656,6 +673,7 @@ const AppState = struct {
     canvas: Canvas,
     cursor_x: usize = 0,
     cursor_y: usize = 0,
+    render_mode: RenderMode = .block,
     mode: Mode = .pen,
     color: Color = .black,
     line_start_x: ?usize = null,
@@ -680,6 +698,7 @@ pub fn main() !void {
 
     var width: usize = 32;
     var height: usize = 16;
+    var render_mode: RenderMode = .block;
 
     // Parse command line arguments
     var i: usize = 1;
@@ -694,12 +713,15 @@ pub fn main() !void {
             if (i < args.len) {
                 height = try std.fmt.parseInt(usize, args[i], 10);
             }
+        } else if (std.mem.eql(u8, args[i], "--sixel")) {
+            render_mode = .sixel;
         } else if (std.mem.eql(u8, args[i], "--help")) {
             std.debug.print(
-                \\Usage: bitmap_paint [options]
+                \\Usage: zigrid [options]
                 \\Options:
                 \\  -w, --width <n>    Set canvas width (max: 128)
                 \\  -h, --height <n>   Set canvas height (max: 64)
+                \\  --sixel            Use sixel rendering instead of default block rendering
                 \\  --help             Show this help message
                 \\
             , .{});
@@ -736,6 +758,7 @@ pub fn main() !void {
 
     var state = AppState{
         .canvas = canvas,
+        .render_mode = render_mode,
         .original_termios = termios,
         .animation = animation,
         .undo_stack = undo_stack,
@@ -810,15 +833,16 @@ pub fn main() !void {
 }
 
 fn renderUI(state: *AppState, stdout: std.fs.File, allocator: std.mem.Allocator) !void {
-    // Use optimized rendering during animation playback
-    if (state.mode == .animation and state.animation.playing) {
-        try state.canvas.renderOptimized(stdout, allocator);
-    } else {
-        try state.canvas.render(stdout);
+    _ = allocator;
+    switch (state.render_mode) {
+        .block => try state.canvas.renderBlock(stdout, state.cursor_x, state.cursor_y),
+        .sixel => try state.canvas.renderSixel(stdout, state.cursor_x, state.cursor_y),
     }
 
-    // Fixed status display area at bottom
-    const status_start_row = state.canvas.height + 3;
+    const status_start_row = switch (state.render_mode) {
+        .block => state.canvas.height + 3,
+        .sixel => (state.canvas.height + 5) / 6 + 2,
+    };
 
     // Move to status area and clear it
     var clear_buf: [64]u8 = undefined;
@@ -869,19 +893,6 @@ fn renderUI(state: *AppState, stdout: std.fs.File, allocator: std.mem.Allocator)
     } else {
         try stdout.writeAll("\n"); // Empty line to keep layout consistent
     }
-
-    // Show cursor position with overlay character
-    const cursor_chars = if (state.canvas.getPixel(state.cursor_x, state.cursor_y)) |pixel|
-        switch (pixel) {
-            .black => "▓▓",
-            .white => "▒▒",
-        }
-    else
-        "??";
-
-    var cursor_buf: [64]u8 = undefined;
-    const cursor_str = try std.fmt.bufPrint(&cursor_buf, "\x1B[{d};{d}H{s}", .{ state.cursor_y + 2, state.cursor_x * 2 + 2, cursor_chars });
-    try stdout.writeAll(cursor_str);
 }
 
 fn readLine(stdin: std.fs.File, buf: []u8) !?[]u8 {
