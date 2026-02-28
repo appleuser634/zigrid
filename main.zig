@@ -13,6 +13,299 @@ const RenderMode = enum {
     sixel,
 };
 
+const PNG_SIGNATURE = [8]u8{ 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
+
+const PngColorType = enum(u8) {
+    grayscale = 0,
+    rgb = 2,
+    rgba = 6,
+};
+
+fn bytesPerRow(width: usize) usize {
+    return (width + 7) / 8;
+}
+
+fn bytesPerFrame(width: usize, height: usize) usize {
+    return bytesPerRow(width) * height;
+}
+
+fn isIdentifierChar(char: u8) bool {
+    return std.ascii.isAlphanumeric(char) or char == '_';
+}
+
+fn sanitizeIdentifier(input: []const u8, buffer: []u8) []const u8 {
+    var idx: usize = 0;
+
+    if (input.len == 0) {
+        buffer[0] = 'a';
+        buffer[1] = 's';
+        buffer[2] = 's';
+        buffer[3] = 'e';
+        buffer[4] = 't';
+        return buffer[0..5];
+    }
+
+    for (input) |char| {
+        if (idx >= buffer.len) break;
+        const normalized = if (isIdentifierChar(char)) char else '_';
+        if (idx == 0 and std.ascii.isDigit(normalized)) {
+            if (idx < buffer.len) {
+                buffer[idx] = '_';
+                idx += 1;
+            }
+            if (idx >= buffer.len) break;
+        }
+        buffer[idx] = normalized;
+        idx += 1;
+    }
+
+    if (idx == 0) {
+        buffer[0] = 'a';
+        buffer[1] = 's';
+        buffer[2] = 's';
+        buffer[3] = 'e';
+        buffer[4] = 't';
+        return buffer[0..5];
+    }
+
+    return buffer[0..idx];
+}
+
+fn assetNameFromPath(path: []const u8, buffer: []u8) []const u8 {
+    const base = std.fs.path.basename(path);
+    const ext = std.fs.path.extension(base);
+    const stem = if (ext.len > 0) base[0 .. base.len - ext.len] else base;
+    return sanitizeIdentifier(stem, buffer);
+}
+
+fn hasPngSignature(bytes: []const u8) bool {
+    return bytes.len >= PNG_SIGNATURE.len and std.mem.eql(u8, bytes[0..PNG_SIGNATURE.len], &PNG_SIGNATURE);
+}
+
+fn readFileAlloc(allocator: std.mem.Allocator, filename: []const u8) ![]u8 {
+    const file = try std.fs.cwd().openFile(filename, .{});
+    defer file.close();
+    return file.readToEndAlloc(allocator, std.math.maxInt(usize));
+}
+
+fn readBigEndianU32(bytes: []const u8, offset: usize) !u32 {
+    if (offset + 4 > bytes.len) return error.UnexpectedEndOfFile;
+    return (@as(u32, bytes[offset]) << 24) |
+        (@as(u32, bytes[offset + 1]) << 16) |
+        (@as(u32, bytes[offset + 2]) << 8) |
+        @as(u32, bytes[offset + 3]);
+}
+
+fn writeBigEndianU32(bytes: []u8, value: u32) void {
+    bytes[0] = @truncate(value >> 24);
+    bytes[1] = @truncate(value >> 16);
+    bytes[2] = @truncate(value >> 8);
+    bytes[3] = @truncate(value);
+}
+
+fn writeLittleEndianU16(bytes: []u8, value: u16) void {
+    bytes[0] = @truncate(value);
+    bytes[1] = @truncate(value >> 8);
+}
+
+fn pngBytesPerPixel(color_type: PngColorType) usize {
+    return switch (color_type) {
+        .grayscale => 1,
+        .rgb => 3,
+        .rgba => 4,
+    };
+}
+
+fn scaledCanvasDimensions(width: usize, height: usize) struct { width: usize, height: usize } {
+    if (width <= MAX_WIDTH and height <= MAX_HEIGHT) {
+        return .{ .width = width, .height = height };
+    }
+
+    const width_product = @as(u64, width) * MAX_HEIGHT;
+    const height_product = @as(u64, MAX_WIDTH) * height;
+
+    if (width_product > height_product) {
+        return .{
+            .width = MAX_WIDTH,
+            .height = @max(@as(usize, 1), (height * MAX_WIDTH) / width),
+        };
+    }
+
+    return .{
+        .width = @max(@as(usize, 1), (width * MAX_HEIGHT) / height),
+        .height = MAX_HEIGHT,
+    };
+}
+
+fn paethPredictor(left: u8, up: u8, up_left: u8) u8 {
+    const p = @as(i32, left) + @as(i32, up) - @as(i32, up_left);
+    const pa = @abs(p - @as(i32, left));
+    const pb = @abs(p - @as(i32, up));
+    const pc = @abs(p - @as(i32, up_left));
+
+    if (pa <= pb and pa <= pc) return left;
+    if (pb <= pc) return up;
+    return up_left;
+}
+
+fn unfilterPngScanlines(
+    allocator: std.mem.Allocator,
+    width: usize,
+    height: usize,
+    bytes_per_pixel: usize,
+    filtered_scanlines: []const u8,
+) ![]u8 {
+    const row_bytes = try std.math.mul(usize, width, bytes_per_pixel);
+    const expected_len = try std.math.mul(usize, height, row_bytes + 1);
+    if (filtered_scanlines.len != expected_len) return error.InvalidPngData;
+
+    const pixel_len = try std.math.mul(usize, height, row_bytes);
+    const pixels = try allocator.alloc(u8, pixel_len);
+    errdefer allocator.free(pixels);
+
+    var src_offset: usize = 0;
+    var dst_offset: usize = 0;
+    var previous_row: []const u8 = &.{};
+
+    for (0..height) |_| {
+        const filter_type = filtered_scanlines[src_offset];
+        src_offset += 1;
+
+        const current_row = pixels[dst_offset .. dst_offset + row_bytes];
+        const filtered_row = filtered_scanlines[src_offset .. src_offset + row_bytes];
+
+        for (filtered_row, 0..) |value, x| {
+            const left = if (x >= bytes_per_pixel) current_row[x - bytes_per_pixel] else 0;
+            const up = if (previous_row.len == row_bytes) previous_row[x] else 0;
+            const up_left = if (previous_row.len == row_bytes and x >= bytes_per_pixel) previous_row[x - bytes_per_pixel] else 0;
+
+            current_row[x] = switch (filter_type) {
+                0 => value,
+                1 => value +% left,
+                2 => value +% up,
+                3 => value +% @as(u8, @intCast((@as(u16, left) + @as(u16, up)) / 2)),
+                4 => value +% paethPredictor(left, up, up_left),
+                else => return error.InvalidPngFilter,
+            };
+        }
+
+        previous_row = current_row;
+        src_offset += row_bytes;
+        dst_offset += row_bytes;
+    }
+
+    return pixels;
+}
+
+fn pngPixelToColor(
+    pixels: []const u8,
+    width: usize,
+    color_type: PngColorType,
+    x: usize,
+    y: usize,
+) Color {
+    const bytes_per_pixel = pngBytesPerPixel(color_type);
+    const offset = (y * width + x) * bytes_per_pixel;
+
+    switch (color_type) {
+        .grayscale => {
+            return if (pixels[offset] < 128) .black else .white;
+        },
+        .rgb => {
+            const r = @as(u32, pixels[offset]);
+            const g = @as(u32, pixels[offset + 1]);
+            const b = @as(u32, pixels[offset + 2]);
+            const luma = (@as(u32, 299) * r + @as(u32, 587) * g + @as(u32, 114) * b) / 1000;
+            return if (luma < 128) .black else .white;
+        },
+        .rgba => {
+            const alpha = pixels[offset + 3];
+            if (alpha == 0) return .white;
+
+            const r = @as(u32, pixels[offset]);
+            const g = @as(u32, pixels[offset + 1]);
+            const b = @as(u32, pixels[offset + 2]);
+            const luma = (@as(u32, 299) * r + @as(u32, 587) * g + @as(u32, 114) * b) / 1000;
+            return if (luma < 128) .black else .white;
+        },
+    }
+}
+
+fn canvasFromPngRaster(
+    allocator: std.mem.Allocator,
+    pixels: []const u8,
+    width: usize,
+    height: usize,
+    color_type: PngColorType,
+) !Canvas {
+    const dimensions = scaledCanvasDimensions(width, height);
+    var canvas = try Canvas.init(allocator, dimensions.width, dimensions.height);
+    errdefer canvas.deinit();
+
+    for (0..dimensions.height) |y| {
+        const source_y = (y * height) / dimensions.height;
+        for (0..dimensions.width) |x| {
+            const source_x = (x * width) / dimensions.width;
+            canvas.pixels[y][x] = pngPixelToColor(pixels, width, color_type, source_x, source_y);
+        }
+    }
+
+    return canvas;
+}
+
+fn writePackedByte(writer: anytype, byte: u8, written_bytes: *usize, first_byte: *bool) !void {
+    if (!first_byte.*) {
+        try writer.writeAll(", ");
+        if (written_bytes.* % 12 == 0) {
+            try writer.writeAll("\n    ");
+        }
+    } else {
+        try writer.writeAll("    ");
+        first_byte.* = false;
+    }
+
+    var buf: [16]u8 = undefined;
+    const byte_str = try std.fmt.bufPrint(&buf, "0x{x:0>2}", .{byte});
+    try writer.writeAll(byte_str);
+    written_bytes.* += 1;
+}
+
+fn writePackedCanvasBytes(writer: anytype, canvas: Canvas) !void {
+    var written_bytes: usize = 0;
+    var first_byte = true;
+
+    for (canvas.pixels) |row| {
+        var x: usize = 0;
+        while (x < canvas.width) {
+            var byte: u8 = 0;
+            var bit_count: usize = 0;
+
+            while (bit_count < 8 and x < canvas.width) : ({
+                x += 1;
+                bit_count += 1;
+            }) {
+                if (row[x] == .black) {
+                    byte |= @as(u8, 1) << @intCast(7 - bit_count);
+                }
+            }
+
+            try writePackedByte(writer, byte, &written_bytes, &first_byte);
+        }
+    }
+
+    try writer.writeAll("\n");
+}
+
+fn writeZigAssetMetadata(writer: anytype, asset_name: []const u8, width: usize, height: usize, frame_count: usize) !void {
+    try writer.print("pub const {s}_width: u8 = {};\n", .{ asset_name, width });
+    try writer.print("pub const {s}_height: u8 = {};\n", .{ asset_name, height });
+    try writer.print("pub const {s}_bytes_per_row: usize = {};\n", .{ asset_name, bytesPerRow(width) });
+    try writer.print("pub const {s}_bytes_per_frame: usize = {};\n", .{ asset_name, bytesPerFrame(width, height) });
+    if (frame_count > 1) {
+        try writer.print("pub const {s}_frame_count: u8 = {};\n", .{ asset_name, frame_count });
+    }
+}
+
 const Canvas = struct {
     width: usize,
     height: usize,
@@ -171,11 +464,10 @@ const Canvas = struct {
                         .black => "▓▓",
                         .white => "▒▒",
                     }
-                else
-                    switch (pixel) {
-                        .black => "██",
-                        .white => "  ",
-                    };
+                else switch (pixel) {
+                    .black => "██",
+                    .white => "  ",
+                };
                 appendBytes(line_buffer[0..], &idx, cell);
             }
             appendBytes(line_buffer[0..], &idx, "│\n");
@@ -308,62 +600,30 @@ const Canvas = struct {
     fn saveCArray(self: Canvas, filename: []const u8) !void {
         const file = try std.fs.cwd().createFile(filename, .{});
         defer file.close();
+        var write_buffer: [4096]u8 = undefined;
+        var writer: std.fs.File.Writer = .init(file, &write_buffer);
 
         // Write array header
-        try file.writeAll("const unsigned char bitmap[] PROGMEM = {\n");
-
-        // Write bitmap data
-        var written_bytes: usize = 0;
-        var first_byte = true;
-
-        for (self.pixels) |row| {
-            var x: usize = 0;
-            while (x < self.width) {
-                var byte: u8 = 0;
-                var bit_count: usize = 0;
-
-                // Pack up to 8 pixels into one byte
-                while (bit_count < 8 and x < self.width) : ({
-                    x += 1;
-                    bit_count += 1;
-                }) {
-                    if (row[x] == .black) {
-                        byte |= @as(u8, 1) << @intCast(7 - bit_count);
-                    }
-                }
-
-                // Write the byte
-                if (!first_byte) {
-                    try file.writeAll(", ");
-                    if (written_bytes % 12 == 0) {
-                        try file.writeAll("\n    ");
-                    }
-                } else {
-                    try file.writeAll("    ");
-                    first_byte = false;
-                }
-
-                var buf: [16]u8 = undefined;
-                const byte_str = try std.fmt.bufPrint(&buf, "0x{x:0>2}", .{byte});
-                try file.writeAll(byte_str);
-
-                written_bytes += 1;
-            }
-        }
-
-        try file.writeAll("\n};\n");
+        try writer.interface.writeAll("const unsigned char bitmap[] PROGMEM = {\n");
+        try writePackedCanvasBytes(&writer.interface, self);
+        try writer.interface.writeAll("};\n");
+        try writer.interface.flush();
     }
 
-    fn load(allocator: std.mem.Allocator, filename: []const u8) !Canvas {
-        const file = try std.fs.cwd().openFile(filename, .{});
+    fn saveZigAsset(self: Canvas, filename: []const u8, asset_name: []const u8) !void {
+        const file = try std.fs.cwd().createFile(filename, .{});
         defer file.close();
+        var write_buffer: [4096]u8 = undefined;
+        var writer: std.fs.File.Writer = .init(file, &write_buffer);
 
-        const file_size = try file.getEndPos();
-        const contents = try allocator.alloc(u8, file_size);
-        defer allocator.free(contents);
-
-        _ = try file.read(contents);
-
+        try writer.interface.print("// zigrid asset: {s}\n", .{asset_name});
+        try writeZigAssetMetadata(&writer.interface, asset_name, self.width, self.height, 1);
+        try writer.interface.print("pub const {s} = [_]u8{{\n", .{asset_name});
+        try writePackedCanvasBytes(&writer.interface, self);
+        try writer.interface.writeAll("};\n");
+        try writer.interface.flush();
+    }
+    fn loadTextBytes(allocator: std.mem.Allocator, contents: []const u8) !Canvas {
         // Parse dimensions
         var it = std.mem.tokenizeSequence(u8, contents, "\n");
         const header = it.next() orelse return error.InvalidFormat;
@@ -387,6 +647,100 @@ const Canvas = struct {
         }
 
         return canvas;
+    }
+
+    fn loadPngBytes(allocator: std.mem.Allocator, contents: []const u8) !Canvas {
+        if (!hasPngSignature(contents)) return error.InvalidPngSignature;
+
+        var offset: usize = PNG_SIGNATURE.len;
+        var seen_ihdr = false;
+        var seen_iend = false;
+        var width: usize = 0;
+        var height: usize = 0;
+        var color_type: PngColorType = .grayscale;
+        var idat_data: std.ArrayList(u8) = .empty;
+        defer idat_data.deinit(allocator);
+
+        while (!seen_iend) {
+            if (offset + 12 > contents.len) return error.InvalidPngData;
+
+            const chunk_len_u32 = try readBigEndianU32(contents, offset);
+            offset += 4;
+
+            const chunk_type = contents[offset .. offset + 4];
+            offset += 4;
+
+            const chunk_len = std.math.cast(usize, chunk_len_u32) orelse return error.InvalidPngData;
+            if (offset + chunk_len + 4 > contents.len) return error.InvalidPngData;
+
+            const chunk_data = contents[offset .. offset + chunk_len];
+            const expected_crc = try readBigEndianU32(contents, offset + chunk_len);
+
+            var crc = std.hash.Crc32.init();
+            crc.update(chunk_type);
+            crc.update(chunk_data);
+            if (crc.final() != expected_crc) return error.InvalidPngChunkCrc;
+
+            if (std.mem.eql(u8, chunk_type, "IHDR")) {
+                if (seen_ihdr or chunk_len != 13) return error.InvalidPngHeader;
+
+                const parsed_width = try readBigEndianU32(chunk_data, 0);
+                const parsed_height = try readBigEndianU32(chunk_data, 4);
+                if (parsed_width == 0 or parsed_height == 0) return error.InvalidPngDimensions;
+
+                width = std.math.cast(usize, parsed_width) orelse return error.InvalidPngDimensions;
+                height = std.math.cast(usize, parsed_height) orelse return error.InvalidPngDimensions;
+
+                if (chunk_data[8] != 8) return error.UnsupportedPngBitDepth;
+                color_type = std.meta.intToEnum(PngColorType, chunk_data[9]) catch return error.UnsupportedPngColorType;
+                if (chunk_data[10] != 0) return error.InvalidPngHeader;
+                if (chunk_data[11] != 0) return error.InvalidPngHeader;
+                if (chunk_data[12] != 0) return error.UnsupportedPngInterlace;
+
+                seen_ihdr = true;
+            } else if (std.mem.eql(u8, chunk_type, "IDAT")) {
+                if (!seen_ihdr) return error.InvalidPngHeader;
+                try idat_data.appendSlice(allocator, chunk_data);
+            } else if (std.mem.eql(u8, chunk_type, "IEND")) {
+                if (!seen_ihdr or chunk_len != 0) return error.InvalidPngData;
+                seen_iend = true;
+            }
+
+            offset += chunk_len + 4;
+        }
+
+        if (!seen_ihdr or idat_data.items.len == 0) return error.InvalidPngData;
+
+        var compressed_reader: std.Io.Reader = .fixed(idat_data.items);
+        var inflate_buffer: [std.compress.flate.max_window_len]u8 = undefined;
+        var decompressor: std.compress.flate.Decompress = .init(&compressed_reader, .zlib, &inflate_buffer);
+        var filtered_scanlines: std.ArrayList(u8) = .empty;
+        defer filtered_scanlines.deinit(allocator);
+        try decompressor.reader.appendRemainingUnlimited(allocator, &filtered_scanlines);
+
+        const unfiltered = try unfilterPngScanlines(
+            allocator,
+            width,
+            height,
+            pngBytesPerPixel(color_type),
+            filtered_scanlines.items,
+        );
+        defer allocator.free(unfiltered);
+
+        return canvasFromPngRaster(allocator, unfiltered, width, height, color_type);
+    }
+
+    fn loadAutoBytes(allocator: std.mem.Allocator, contents: []const u8) !Canvas {
+        if (hasPngSignature(contents)) {
+            return Canvas.loadPngBytes(allocator, contents);
+        }
+        return Canvas.loadTextBytes(allocator, contents);
+    }
+
+    fn load(allocator: std.mem.Allocator, filename: []const u8) !Canvas {
+        const contents = try readFileAlloc(allocator, filename);
+        defer allocator.free(contents);
+        return Canvas.loadAutoBytes(allocator, contents);
     }
 };
 
@@ -423,15 +777,14 @@ const AnimationState = struct {
     fn saveCArray(self: AnimationState, filename: []const u8) !void {
         const file = try std.fs.cwd().createFile(filename, .{});
         defer file.close();
+        var write_buffer: [4096]u8 = undefined;
+        var writer: std.fs.File.Writer = .init(file, &write_buffer);
 
         // Write array header with frame count comment
         var header_buf: [256]u8 = undefined;
         const header = try std.fmt.bufPrint(&header_buf, "// Animation with {d} frames, {d}x{d} pixels each\n", .{ self.frame_count, self.frames[0].width, self.frames[0].height });
-        try file.writeAll(header);
-        try file.writeAll("const unsigned char animation[] PROGMEM = {\n");
-
-        var written_bytes: usize = 0;
-        var first_byte = true;
+        try writer.interface.writeAll(header);
+        try writer.interface.writeAll("const unsigned char animation[] PROGMEM = {\n");
 
         // Process each frame
         for (0..self.frame_count) |frame_idx| {
@@ -439,54 +792,19 @@ const AnimationState = struct {
 
             // Add frame comment
             if (frame_idx > 0) {
-                try file.writeAll("\n    // Frame ");
+                try writer.interface.writeAll("\n    // Frame ");
                 var frame_buf: [32]u8 = undefined;
                 const frame_str = try std.fmt.bufPrint(&frame_buf, "{d}\n", .{frame_idx + 1});
-                try file.writeAll(frame_str);
+                try writer.interface.writeAll(frame_str);
             }
 
-            // Write frame data
-            for (frame.pixels) |row| {
-                var x: usize = 0;
-                while (x < frame.width) {
-                    var byte: u8 = 0;
-                    var bit_count: usize = 0;
-
-                    // Pack up to 8 pixels into one byte
-                    while (bit_count < 8 and x < frame.width) : ({
-                        x += 1;
-                        bit_count += 1;
-                    }) {
-                        if (row[x] == .black) {
-                            byte |= @as(u8, 1) << @intCast(7 - bit_count);
-                        }
-                    }
-
-                    // Write the byte
-                    if (!first_byte) {
-                        try file.writeAll(", ");
-                        if (written_bytes % 12 == 0) {
-                            try file.writeAll("\n    ");
-                        }
-                    } else {
-                        try file.writeAll("    ");
-                        first_byte = false;
-                    }
-
-                    var buf: [16]u8 = undefined;
-                    const byte_str = try std.fmt.bufPrint(&buf, "0x{x:0>2}", .{byte});
-                    try file.writeAll(byte_str);
-
-                    written_bytes += 1;
-                }
-            }
+            try writePackedCanvasBytes(&writer.interface, frame.*);
         }
 
-        try file.writeAll("\n};\n");
+        try writer.interface.writeAll("};\n");
 
         // Write frame size constants
-        const bytes_per_row = (self.frames[0].width + 7) / 8;
-        const bytes_per_frame = bytes_per_row * self.frames[0].height;
+        const packed_bytes_per_frame = bytesPerFrame(self.frames[0].width, self.frames[0].height);
 
         var const_buf: [512]u8 = undefined;
         const constants = try std.fmt.bufPrint(&const_buf,
@@ -496,52 +814,21 @@ const AnimationState = struct {
             \\const unsigned int FRAME_COUNT = {d};
             \\const unsigned int BYTES_PER_FRAME = {d};
             \\
-        , .{ self.frames[0].width, self.frames[0].height, self.frame_count, bytes_per_frame });
-        try file.writeAll(constants);
+        , .{ self.frames[0].width, self.frames[0].height, self.frame_count, packed_bytes_per_frame });
+        try writer.interface.writeAll(constants);
+        try writer.interface.flush();
     }
 
-    fn writeFrameCArray(frame: *const Canvas, file: std.fs.File) !void {
-        var written_bytes: usize = 0;
-        var first_byte = true;
-
-        for (frame.pixels) |row| {
-            var x: usize = 0;
-            while (x < frame.width) {
-                var byte: u8 = 0;
-                var bit_count: usize = 0;
-
-                while (bit_count < 8 and x < frame.width) : ({
-                    x += 1;
-                    bit_count += 1;
-                }) {
-                    if (row[x] == .black) {
-                        byte |= @as(u8, 1) << @intCast(7 - bit_count);
-                    }
-                }
-
-                if (!first_byte) {
-                    try file.writeAll(", ");
-                    if (written_bytes % 12 == 0) {
-                        try file.writeAll("\n    ");
-                    }
-                } else {
-                    try file.writeAll("    ");
-                    first_byte = false;
-                }
-
-                var buf: [16]u8 = undefined;
-                const byte_str = try std.fmt.bufPrint(&buf, "0x{x:0>2}", .{byte});
-                try file.writeAll(byte_str);
-
-                written_bytes += 1;
-            }
-        }
-        try file.writeAll("\n};\n\n");
+    fn writeFrameCArray(frame: *const Canvas, writer: anytype) !void {
+        try writePackedCanvasBytes(writer, frame.*);
+        try writer.writeAll("};\n\n");
     }
 
     fn saveFrameHeader(self: AnimationState, filename: []const u8) !void {
         const file = try std.fs.cwd().createFile(filename, .{});
         defer file.close();
+        var write_buffer: [4096]u8 = undefined;
+        var writer: std.fs.File.Writer = .init(file, &write_buffer);
 
         var header_buf: [256]u8 = undefined;
         const header = try std.fmt.bufPrint(&header_buf, "// Frames: {d}, Size: {d}x{d}\n\n", .{
@@ -549,35 +836,34 @@ const AnimationState = struct {
             self.frames[0].width,
             self.frames[0].height,
         });
-        try file.writeAll(header);
+        try writer.interface.writeAll(header);
 
         for (0..self.frame_count) |frame_idx| {
             const frame = &self.frames[frame_idx];
             var name_buf: [32]u8 = undefined;
             const frame_name = try std.fmt.bufPrint(&name_buf, "frame_{d:0>2}", .{frame_idx + 1});
 
-            try file.writeAll("const unsigned char ");
-            try file.writeAll(frame_name);
-            try file.writeAll("[] PROGMEM = {\n");
-            try writeFrameCArray(frame, file);
+            try writer.interface.writeAll("const unsigned char ");
+            try writer.interface.writeAll(frame_name);
+            try writer.interface.writeAll("[] PROGMEM = {\n");
+            try writeFrameCArray(frame, &writer.interface);
         }
 
-        try file.writeAll("const unsigned char* const animation_frames[] PROGMEM = {\n");
+        try writer.interface.writeAll("const unsigned char* const animation_frames[] PROGMEM = {\n");
         for (0..self.frame_count) |frame_idx| {
             var name_buf: [32]u8 = undefined;
             const frame_name = try std.fmt.bufPrint(&name_buf, "frame_{d:0>2}", .{frame_idx + 1});
-            try file.writeAll("    ");
-            try file.writeAll(frame_name);
+            try writer.interface.writeAll("    ");
+            try writer.interface.writeAll(frame_name);
             if (frame_idx + 1 < self.frame_count) {
-                try file.writeAll(",\n");
+                try writer.interface.writeAll(",\n");
             } else {
-                try file.writeAll("\n");
+                try writer.interface.writeAll("\n");
             }
         }
-        try file.writeAll("};\n");
+        try writer.interface.writeAll("};\n");
 
-        const bytes_per_row = (self.frames[0].width + 7) / 8;
-        const bytes_per_frame = bytes_per_row * self.frames[0].height;
+        const packed_bytes_per_frame = bytesPerFrame(self.frames[0].width, self.frames[0].height);
 
         var const_buf: [512]u8 = undefined;
         const constants = try std.fmt.bufPrint(&const_buf,
@@ -587,10 +873,42 @@ const AnimationState = struct {
             \\const unsigned int FRAME_COUNT = {d};
             \\const unsigned int BYTES_PER_FRAME = {d};
             \\
-        , .{ self.frames[0].width, self.frames[0].height, self.frame_count, bytes_per_frame });
-        try file.writeAll(constants);
+        , .{ self.frames[0].width, self.frames[0].height, self.frame_count, packed_bytes_per_frame });
+        try writer.interface.writeAll(constants);
+        try writer.interface.flush();
     }
 
+    fn saveZigAsset(self: AnimationState, filename: []const u8, asset_name: []const u8) !void {
+        const file = try std.fs.cwd().createFile(filename, .{});
+        defer file.close();
+        var write_buffer: [4096]u8 = undefined;
+        var writer: std.fs.File.Writer = .init(file, &write_buffer);
+
+        try writer.interface.print("// zigrid animated asset: {s}\n", .{asset_name});
+        try writeZigAssetMetadata(&writer.interface, asset_name, self.frames[0].width, self.frames[0].height, self.frame_count);
+
+        for (0..self.frame_count) |frame_idx| {
+            var frame_name_buf: [128]u8 = undefined;
+            const frame_name = try std.fmt.bufPrint(&frame_name_buf, "{s}_{d}", .{ asset_name, frame_idx + 1 });
+            try writer.interface.print("pub const {s} = [_]u8{{\n", .{frame_name});
+            try writePackedCanvasBytes(&writer.interface, self.frames[frame_idx]);
+            try writer.interface.writeAll("};\n");
+        }
+
+        try writer.interface.print("pub const {s}_frames = [_][]const u8{{\n", .{asset_name});
+        for (0..self.frame_count) |frame_idx| {
+            var frame_name_buf: [128]u8 = undefined;
+            const frame_name = try std.fmt.bufPrint(&frame_name_buf, "{s}_{d}", .{ asset_name, frame_idx + 1 });
+            try writer.interface.print("    {s}[0..]", .{frame_name});
+            if (frame_idx + 1 < self.frame_count) {
+                try writer.interface.writeAll(",\n");
+            } else {
+                try writer.interface.writeAll("\n");
+            }
+        }
+        try writer.interface.writeAll("};\n");
+        try writer.interface.flush();
+    }
     fn saveAnimation(self: AnimationState, filename: []const u8) !void {
         const file = try std.fs.cwd().createFile(filename, .{});
         defer file.close();
@@ -699,6 +1017,12 @@ pub fn main() !void {
     var width: usize = 32;
     var height: usize = 16;
     var render_mode: RenderMode = .block;
+    var stats_only = false;
+    var export_zig_name: ?[]const u8 = null;
+    var export_zig_anim_name: ?[]const u8 = null;
+    var output_path: ?[]const u8 = null;
+    var load_path: ?[]const u8 = null;
+    var load_anim_path: ?[]const u8 = null;
 
     // Parse command line arguments
     var i: usize = 1;
@@ -713,6 +1037,43 @@ pub fn main() !void {
             if (i < args.len) {
                 height = try std.fmt.parseInt(usize, args[i], 10);
             }
+        } else if (std.mem.eql(u8, args[i], "--load")) {
+            i += 1;
+            if (i < args.len) {
+                load_path = args[i];
+            } else {
+                return error.MissingArgument;
+            }
+        } else if (std.mem.eql(u8, args[i], "--load-anim")) {
+            i += 1;
+            if (i < args.len) {
+                load_anim_path = args[i];
+            } else {
+                return error.MissingArgument;
+            }
+        } else if (std.mem.eql(u8, args[i], "--export-zig")) {
+            i += 1;
+            if (i < args.len) {
+                export_zig_name = args[i];
+            } else {
+                return error.MissingArgument;
+            }
+        } else if (std.mem.eql(u8, args[i], "--export-zig-anim")) {
+            i += 1;
+            if (i < args.len) {
+                export_zig_anim_name = args[i];
+            } else {
+                return error.MissingArgument;
+            }
+        } else if (std.mem.eql(u8, args[i], "--output")) {
+            i += 1;
+            if (i < args.len) {
+                output_path = args[i];
+            } else {
+                return error.MissingArgument;
+            }
+        } else if (std.mem.eql(u8, args[i], "--stats")) {
+            stats_only = true;
         } else if (std.mem.eql(u8, args[i], "--sixel")) {
             render_mode = .sixel;
         } else if (std.mem.eql(u8, args[i], "--help")) {
@@ -721,6 +1082,13 @@ pub fn main() !void {
                 \\Options:
                 \\  -w, --width <n>    Set canvas width (max: 128)
                 \\  -h, --height <n>   Set canvas height (max: 64)
+                \\  --load <file>      Load a zigrid canvas file or PNG image before starting
+                \\  --load-anim <file> Load a zigrid animation file before starting
+                \\  --export-zig <id>  Export current canvas as a Zig asset module and exit
+                \\  --export-zig-anim <id>
+                \\                     Export current animation as a Zig asset module and exit
+                \\  --output <file>    Output path for non-interactive export
+                \\  --stats            Print packed asset size stats and exit
                 \\  --sixel            Use sixel rendering instead of default block rendering
                 \\  --help             Show this help message
                 \\
@@ -744,6 +1112,89 @@ pub fn main() !void {
     const stdout_file = std.fs.File{ .handle = std.posix.STDOUT_FILENO };
     const stdin = std.fs.File{ .handle = std.posix.STDIN_FILENO };
 
+    // Initialize first frame with copy of canvas
+    animation.frames[0] = try canvas.copy(allocator);
+    var cleanup_animation_frames = true;
+    defer {
+        if (cleanup_animation_frames) {
+            for (0..animation.frame_count) |frame_idx| {
+                animation.frames[frame_idx].deinit();
+            }
+        }
+    }
+
+    if (load_path != null and load_anim_path != null) {
+        std.debug.print("Use either --load or --load-anim, not both.\n", .{});
+        return;
+    }
+    if (export_zig_name != null and export_zig_anim_name != null) {
+        std.debug.print("Use either --export-zig or --export-zig-anim, not both.\n", .{});
+        return;
+    }
+
+    if (load_path) |path| {
+        const loaded = try Canvas.load(allocator, path);
+        canvas.deinit();
+        canvas = loaded;
+        animation.frames[0].deinit();
+        animation.frames[0] = try canvas.copy(allocator);
+    } else if (load_anim_path) |path| {
+        animation.frames[0].deinit();
+        try animation.loadAnimation(allocator, path);
+        canvas.deinit();
+        canvas = try animation.frames[animation.current_frame].copy(allocator);
+        width = canvas.width;
+        height = canvas.height;
+    }
+
+    if (stats_only or export_zig_name != null or export_zig_anim_name != null) {
+        if ((export_zig_name != null or export_zig_anim_name != null) and output_path == null) {
+            std.debug.print("--output is required for Zig asset export.\n", .{});
+            return;
+        }
+
+        if (load_anim_path != null or export_zig_anim_name != null) {
+            const label = if (export_zig_anim_name) |name| name else "animation";
+            std.debug.print(
+                "{s}: {d}x{d} px | {d} bytes/row | {d} bytes/frame | {d} frame(s) | {d} total bytes\n",
+                .{
+                    label,
+                    animation.frames[0].width,
+                    animation.frames[0].height,
+                    bytesPerRow(animation.frames[0].width),
+                    bytesPerFrame(animation.frames[0].width, animation.frames[0].height),
+                    animation.frame_count,
+                    bytesPerFrame(animation.frames[0].width, animation.frames[0].height) * animation.frame_count,
+                },
+            );
+        } else {
+            const label = if (export_zig_name) |name| name else "canvas";
+            std.debug.print(
+                "{s}: {d}x{d} px | {d} bytes/row | {d} bytes/frame | {d} frame(s) | {d} total bytes\n",
+                .{
+                    label,
+                    canvas.width,
+                    canvas.height,
+                    bytesPerRow(canvas.width),
+                    bytesPerFrame(canvas.width, canvas.height),
+                    @as(usize, 1),
+                    bytesPerFrame(canvas.width, canvas.height),
+                },
+            );
+        }
+
+        if (export_zig_name) |name| {
+            var id_buf: [128]u8 = undefined;
+            const asset_name = sanitizeIdentifier(name, &id_buf);
+            try canvas.saveZigAsset(output_path.?, asset_name);
+        } else if (export_zig_anim_name) |name| {
+            var id_buf: [128]u8 = undefined;
+            const asset_name = sanitizeIdentifier(name, &id_buf);
+            try animation.saveZigAsset(output_path.?, asset_name);
+        }
+        return;
+    }
+
     // Check if we're running in a terminal
     if (!std.posix.isatty(stdin.handle)) {
         std.debug.print("This program must be run in an interactive terminal.\n", .{});
@@ -753,9 +1204,6 @@ pub fn main() !void {
     // Set terminal to raw mode
     const termios = try std.posix.tcgetattr(stdin.handle);
 
-    // Initialize first frame with copy of canvas
-    animation.frames[0] = try canvas.copy(allocator);
-
     var state = AppState{
         .canvas = canvas,
         .render_mode = render_mode,
@@ -764,6 +1212,7 @@ pub fn main() !void {
         .undo_stack = undo_stack,
         .redo_stack = redo_stack,
     };
+    cleanup_animation_frames = false;
 
     defer {
         for (0..state.animation.frame_count) |frame_idx| {
@@ -852,28 +1301,30 @@ fn renderUI(state: *AppState, stdout: std.fs.File, allocator: std.mem.Allocator)
     // Status line
     var status_buf: [256]u8 = undefined;
     if (state.mode == .animation) {
-        const status_str = try std.fmt.bufPrint(&status_buf, "Animation Mode | Frame: {d}/{d} | Speed: {d}ms | {s}\n", .{
+        const status_str = try std.fmt.bufPrint(&status_buf, "Animation Mode | Frame: {d}/{d} | Speed: {d}ms | {d} bytes/frame | {s}\n", .{
             state.animation.current_frame + 1,
             state.animation.frame_count,
             state.animation.frame_delay_ms,
+            bytesPerFrame(state.canvas.width, state.canvas.height),
             if (state.animation.playing) "PLAYING" else "EDITING",
         });
         try stdout.writeAll(status_str);
     } else {
-        const status_str = try std.fmt.bufPrint(&status_buf, "Mode: {s} | Color: {s} | Position: ({d}, {d})\n", .{
+        const status_str = try std.fmt.bufPrint(&status_buf, "Mode: {s} | Color: {s} | Position: ({d}, {d}) | {d} bytes/frame\n", .{
             @tagName(state.mode),
             @tagName(state.color),
             state.cursor_x,
             state.cursor_y,
+            bytesPerFrame(state.canvas.width, state.canvas.height),
         });
         try stdout.writeAll(status_str);
     }
 
     // Help text
     if (state.mode == .animation) {
-        try stdout.writeAll("Animation: [/]=prev/next frame, n=new frame, d=delete frame, y=duplicate frame, p=play/pause, -/+=speed, a=save anim, o=load anim, A=save frame header\n");
+        try stdout.writeAll("Animation: [/]=prev/next frame, n=new frame, d=delete frame, y=duplicate frame, p=play/pause, -/+=speed, a=save anim, o=load anim, A=save frame header, z=save frame Zig, Z=save anim Zig\n");
     } else {
-        try stdout.writeAll("Controls: hjkl/arrows=move, space=draw, u=undo, r=redo, m=mode, c=color, s=save, S=save C array, L=load, C=clear, q=quit\n");
+        try stdout.writeAll("Controls: hjkl/arrows=move, space=draw, u=undo, r=redo, m=mode, c=color, s=save, S=save C array, z=save Zig, L=load, C=clear, q=quit\n");
     }
 
     if (state.mode == .line and state.line_start_x != null) {
@@ -1202,6 +1653,28 @@ fn handleInput(state: *AppState, key: u8, allocator: std.mem.Allocator, stdin: s
             }
         },
 
+        'z' => {
+            try stdout_file.writeAll(if (state.mode == .animation)
+                "\nEnter Zig asset filename for current frame: "
+            else
+                "\nEnter Zig asset filename: ");
+
+            const raw = try std.posix.tcgetattr(stdin.handle);
+            try std.posix.tcsetattr(stdin.handle, .NOW, state.original_termios);
+            defer std.posix.tcsetattr(stdin.handle, .NOW, raw) catch {};
+
+            var buf: [256]u8 = undefined;
+            if (try readLine(stdin, &buf)) |filename| {
+                var name_buf: [128]u8 = undefined;
+                const asset_name = assetNameFromPath(filename, &name_buf);
+                state.canvas.saveZigAsset(filename, asset_name) catch |err| {
+                    var err_buf: [256]u8 = undefined;
+                    const err_str = try std.fmt.bufPrint(&err_buf, "Error saving Zig asset: {any}\n", .{err});
+                    try stdout_file.writeAll(err_str);
+                };
+            }
+        },
+
         'A' => {
             if (state.mode == .animation) {
                 // Save current frame first
@@ -1219,6 +1692,30 @@ fn handleInput(state: *AppState, key: u8, allocator: std.mem.Allocator, stdin: s
                     state.animation.saveFrameHeader(filename) catch |err| {
                         var err_buf: [256]u8 = undefined;
                         const err_str = try std.fmt.bufPrint(&err_buf, "Error saving frame header: {any}\n", .{err});
+                        try stdout_file.writeAll(err_str);
+                    };
+                }
+            }
+        },
+
+        'Z' => {
+            if (state.mode == .animation) {
+                state.animation.frames[state.animation.current_frame].deinit();
+                state.animation.frames[state.animation.current_frame] = try state.canvas.copy(allocator);
+
+                try stdout_file.writeAll("\nEnter Zig asset filename for animation: ");
+
+                const raw = try std.posix.tcgetattr(stdin.handle);
+                try std.posix.tcsetattr(stdin.handle, .NOW, state.original_termios);
+                defer std.posix.tcsetattr(stdin.handle, .NOW, raw) catch {};
+
+                var buf: [256]u8 = undefined;
+                if (try readLine(stdin, &buf)) |filename| {
+                    var name_buf: [128]u8 = undefined;
+                    const asset_name = assetNameFromPath(filename, &name_buf);
+                    state.animation.saveZigAsset(filename, asset_name) catch |err| {
+                        var err_buf: [256]u8 = undefined;
+                        const err_str = try std.fmt.bufPrint(&err_buf, "Error saving Zig animation asset: {any}\n", .{err});
                         try stdout_file.writeAll(err_str);
                     };
                 }
@@ -1413,4 +1910,162 @@ fn handleInput(state: *AppState, key: u8, allocator: std.mem.Allocator, stdin: s
 
         else => {},
     }
+}
+
+fn appendPngChunk(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    chunk_type: []const u8,
+    chunk_data: []const u8,
+) !void {
+    var len_bytes: [4]u8 = undefined;
+    var crc_bytes: [4]u8 = undefined;
+
+    writeBigEndianU32(&len_bytes, @intCast(chunk_data.len));
+    try output.appendSlice(allocator, &len_bytes);
+    try output.appendSlice(allocator, chunk_type);
+    try output.appendSlice(allocator, chunk_data);
+
+    var crc = std.hash.Crc32.init();
+    crc.update(chunk_type);
+    crc.update(chunk_data);
+    writeBigEndianU32(&crc_bytes, crc.final());
+    try output.appendSlice(allocator, &crc_bytes);
+}
+
+fn buildZlibStoreBlock(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    if (bytes.len > std.math.maxInt(u16)) return error.TestDataTooLarge;
+
+    const output = try allocator.alloc(u8, 2 + 1 + 2 + 2 + bytes.len + 4);
+    errdefer allocator.free(output);
+
+    output[0] = 0x78;
+    output[1] = 0x01;
+    output[2] = 0x01;
+    writeLittleEndianU16(output[3..5], @intCast(bytes.len));
+    writeLittleEndianU16(output[5..7], ~@as(u16, @intCast(bytes.len)));
+    @memcpy(output[7 .. 7 + bytes.len], bytes);
+
+    var adler = std.hash.Adler32{};
+    adler.update(bytes);
+    writeBigEndianU32(output[7 + bytes.len .. 11 + bytes.len], adler.adler);
+
+    return output;
+}
+
+fn buildTestPng(
+    allocator: std.mem.Allocator,
+    width: usize,
+    height: usize,
+    color_type: PngColorType,
+    interlace_method: u8,
+    pixels: []const u8,
+) ![]u8 {
+    const bytes_per_pixel = pngBytesPerPixel(color_type);
+    const row_bytes = try std.math.mul(usize, width, bytes_per_pixel);
+    if (pixels.len != try std.math.mul(usize, row_bytes, height)) return error.InvalidTestData;
+
+    var scanlines: std.ArrayList(u8) = .empty;
+    defer scanlines.deinit(allocator);
+    try scanlines.ensureTotalCapacity(allocator, height * (row_bytes + 1));
+
+    for (0..height) |y| {
+        try scanlines.append(allocator, 0);
+        try scanlines.appendSlice(allocator, pixels[y * row_bytes .. (y + 1) * row_bytes]);
+    }
+
+    const idat = try buildZlibStoreBlock(allocator, scanlines.items);
+    defer allocator.free(idat);
+
+    var ihdr: [13]u8 = undefined;
+    writeBigEndianU32(ihdr[0..4], @intCast(width));
+    writeBigEndianU32(ihdr[4..8], @intCast(height));
+    ihdr[8] = 8;
+    ihdr[9] = @intFromEnum(color_type);
+    ihdr[10] = 0;
+    ihdr[11] = 0;
+    ihdr[12] = interlace_method;
+
+    var png: std.ArrayList(u8) = .empty;
+    defer png.deinit(allocator);
+    try png.appendSlice(allocator, &PNG_SIGNATURE);
+    try appendPngChunk(allocator, &png, "IHDR", &ihdr);
+    try appendPngChunk(allocator, &png, "IDAT", idat);
+    try appendPngChunk(allocator, &png, "IEND", "");
+
+    return png.toOwnedSlice(allocator);
+}
+
+test "PNG load auto-detects RGBA and keeps transparent pixels white" {
+    const allocator = std.testing.allocator;
+    const pixels = [_]u8{
+        0,  0,  0,  255,
+        10, 20, 30, 0,
+    };
+    const png = try buildTestPng(allocator, 2, 1, .rgba, 0, &pixels);
+    defer allocator.free(png);
+
+    var canvas = try Canvas.loadAutoBytes(allocator, png);
+    defer canvas.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), canvas.width);
+    try std.testing.expectEqual(@as(usize, 1), canvas.height);
+    try std.testing.expectEqual(Color.black, canvas.pixels[0][0]);
+    try std.testing.expectEqual(Color.white, canvas.pixels[0][1]);
+}
+
+test "PNG load scales oversized grayscale images to fit the canvas" {
+    const allocator = std.testing.allocator;
+    const width = 256;
+    const height = 64;
+    const pixels = try allocator.alloc(u8, width * height);
+    defer allocator.free(pixels);
+    @memset(pixels, 0);
+
+    const png = try buildTestPng(allocator, width, height, .grayscale, 0, pixels);
+    defer allocator.free(png);
+
+    var canvas = try Canvas.loadAutoBytes(allocator, png);
+    defer canvas.deinit();
+
+    try std.testing.expectEqual(@as(usize, 128), canvas.width);
+    try std.testing.expectEqual(@as(usize, 32), canvas.height);
+    try std.testing.expectEqual(Color.black, canvas.pixels[0][0]);
+    try std.testing.expectEqual(Color.black, canvas.pixels[canvas.height - 1][canvas.width - 1]);
+}
+
+test "PNG load rejects unsupported interlaced images" {
+    const allocator = std.testing.allocator;
+    const pixels = [_]u8{0};
+    const png = try buildTestPng(allocator, 1, 1, .grayscale, 1, &pixels);
+    defer allocator.free(png);
+
+    try std.testing.expectError(error.UnsupportedPngInterlace, Canvas.loadAutoBytes(allocator, png));
+}
+
+test "PNG load rejects invalid CRC" {
+    const allocator = std.testing.allocator;
+    const pixels = [_]u8{0};
+    var png = try buildTestPng(allocator, 1, 1, .grayscale, 0, &pixels);
+    defer allocator.free(png);
+
+    png[15] ^= 0x01;
+    try std.testing.expectError(error.InvalidPngChunkCrc, Canvas.loadAutoBytes(allocator, png));
+}
+
+test "PNG unfilter supports Sub and Paeth filters" {
+    const allocator = std.testing.allocator;
+    const sub_filtered = [_]u8{ 1, 10, 10, 5 };
+    const paeth_filtered = [_]u8{
+        0, 10, 20, 30,
+        4, 5,  5,  5,
+    };
+
+    const sub_pixels = try unfilterPngScanlines(allocator, 3, 1, 1, &sub_filtered);
+    defer allocator.free(sub_pixels);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 20, 25 }, sub_pixels);
+
+    const paeth_pixels = try unfilterPngScanlines(allocator, 3, 2, 1, &paeth_filtered);
+    defer allocator.free(paeth_pixels);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 20, 30, 15, 25, 35 }, paeth_pixels);
 }
