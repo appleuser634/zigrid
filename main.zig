@@ -21,6 +21,13 @@ const PngColorType = enum(u8) {
     rgba = 6,
 };
 
+const SelectionRect = struct {
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+};
+
 fn bytesPerRow(width: usize) usize {
     return (width + 7) / 8;
 }
@@ -352,6 +359,23 @@ const Canvas = struct {
                 new_canvas.pixels[y][x] = pixel;
             }
         }
+        return new_canvas;
+    }
+
+    fn crop(self: Canvas, allocator: std.mem.Allocator, x: usize, y: usize, w: usize, h: usize) !Canvas {
+        if (w == 0 or h == 0) return error.InvalidCropRect;
+        if (x >= self.width or y >= self.height) return error.InvalidCropRect;
+        if (x + w > self.width or y + h > self.height) return error.InvalidCropRect;
+
+        var new_canvas = try Canvas.init(allocator, w, h);
+        errdefer new_canvas.deinit();
+
+        for (0..h) |dst_y| {
+            for (0..w) |dst_x| {
+                new_canvas.pixels[dst_y][dst_x] = self.pixels[y + dst_y][x + dst_x];
+            }
+        }
+
         return new_canvas;
     }
 
@@ -1006,6 +1030,60 @@ const AppState = struct {
     redo_count: usize = 0,
 };
 
+fn currentSelectionRect(state: *const AppState) ?SelectionRect {
+    if (state.rect_start_x == null or state.rect_start_y == null) return null;
+
+    const x = @min(state.rect_start_x.?, state.cursor_x);
+    const y = @min(state.rect_start_y.?, state.cursor_y);
+    const w = @abs(@as(isize, @intCast(state.cursor_x)) - @as(isize, @intCast(state.rect_start_x.?))) + 1;
+    const h = @abs(@as(isize, @intCast(state.cursor_y)) - @as(isize, @intCast(state.rect_start_y.?))) + 1;
+
+    return .{
+        .x = x,
+        .y = y,
+        .w = @intCast(w),
+        .h = @intCast(h),
+    };
+}
+
+fn clearSelection(state: *AppState) void {
+    state.line_start_x = null;
+    state.line_start_y = null;
+    state.rect_start_x = null;
+    state.rect_start_y = null;
+}
+
+fn cropAnimationFrames(state: *AppState, allocator: std.mem.Allocator, rect: SelectionRect) !void {
+    const current_frame = state.animation.current_frame;
+    const current_canvas_copy = try state.canvas.copy(allocator);
+    state.animation.frames[current_frame].deinit();
+    state.animation.frames[current_frame] = current_canvas_copy;
+
+    const new_frames = try allocator.alloc(Canvas, state.animation.frame_count);
+    defer allocator.free(new_frames);
+
+    var built_count: usize = 0;
+    errdefer {
+        for (0..built_count) |idx| {
+            new_frames[idx].deinit();
+        }
+    }
+
+    for (0..state.animation.frame_count) |frame_idx| {
+        new_frames[frame_idx] = try state.animation.frames[frame_idx].crop(allocator, rect.x, rect.y, rect.w, rect.h);
+        built_count += 1;
+    }
+
+    for (0..state.animation.frame_count) |frame_idx| {
+        state.animation.frames[frame_idx].deinit();
+        state.animation.frames[frame_idx] = new_frames[frame_idx];
+    }
+
+    const new_canvas = try state.animation.frames[current_frame].copy(allocator);
+    state.canvas.deinit();
+    state.canvas = new_canvas;
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -1098,7 +1176,12 @@ pub fn main() !void {
     }
 
     var canvas = try Canvas.init(allocator, width, height);
-    defer canvas.deinit();
+    var cleanup_canvas = true;
+    defer {
+        if (cleanup_canvas) {
+            canvas.deinit();
+        }
+    }
 
     // Initialize animation state
     var animation = try AnimationState.init(allocator);
@@ -1212,9 +1295,11 @@ pub fn main() !void {
         .undo_stack = undo_stack,
         .redo_stack = redo_stack,
     };
+    cleanup_canvas = false;
     cleanup_animation_frames = false;
 
     defer {
+        state.canvas.deinit();
         for (0..state.animation.frame_count) |frame_idx| {
             state.animation.frames[frame_idx].deinit();
         }
@@ -1324,7 +1409,7 @@ fn renderUI(state: *AppState, stdout: std.fs.File, allocator: std.mem.Allocator)
     if (state.mode == .animation) {
         try stdout.writeAll("Animation: [/]=prev/next frame, n=new frame, d=delete frame, y=duplicate frame, p=play/pause, -/+=speed, a=save anim, o=load anim, A=save frame header, z=save frame Zig, Z=save anim Zig\n");
     } else {
-        try stdout.writeAll("Controls: hjkl/arrows=move, space=draw, u=undo, r=redo, m=mode, c=color, s=save, S=save C array, z=save Zig, L=load, C=clear, q=quit\n");
+        try stdout.writeAll("Controls: hjkl/arrows=move, space=draw, u=undo, r=redo, m=mode, c=color, s=save, S=save C array, z=save Zig, L=load, t=crop, C=clear, q=quit\n");
     }
 
     if (state.mode == .line and state.line_start_x != null) {
@@ -1336,9 +1421,10 @@ fn renderUI(state: *AppState, stdout: std.fs.File, allocator: std.mem.Allocator)
         try stdout.writeAll(line_str);
     } else if (state.mode == .rectangle and state.rect_start_x != null) {
         var rect_buf: [128]u8 = undefined;
-        const rect_str = try std.fmt.bufPrint(&rect_buf, "Rectangle from ({d}, {d}) - press space to complete, f for filled\n", .{
+        const rect_str = try std.fmt.bufPrint(&rect_buf, "Rectangle from ({d}, {d}) - press space to complete, f for filled, t to crop{s}\n", .{
             state.rect_start_x.?,
             state.rect_start_y.?,
+            if (state.animation.frame_count > 1) " all frames" else "",
         });
         try stdout.writeAll(rect_str);
     } else {
@@ -1525,13 +1611,9 @@ fn handleInput(state: *AppState, key: u8, allocator: std.mem.Allocator, stdin: s
                     if (state.rect_start_x == null) {
                         state.rect_start_x = state.cursor_x;
                         state.rect_start_y = state.cursor_y;
-                    } else {
-                        const x = @min(state.rect_start_x.?, state.cursor_x);
-                        const y = @min(state.rect_start_y.?, state.cursor_y);
-                        const w = @abs(@as(isize, @intCast(state.cursor_x)) - @as(isize, @intCast(state.rect_start_x.?))) + 1;
-                        const h = @abs(@as(isize, @intCast(state.cursor_y)) - @as(isize, @intCast(state.rect_start_y.?))) + 1;
+                    } else if (currentSelectionRect(state)) |rect| {
                         try pushUndoCopy(state, allocator);
-                        state.canvas.drawRectangle(x, y, @intCast(w), @intCast(h), state.color, false);
+                        state.canvas.drawRectangle(rect.x, rect.y, rect.w, rect.h, state.color, false);
                         state.rect_start_x = null;
                         state.rect_start_y = null;
                     }
@@ -1557,15 +1639,31 @@ fn handleInput(state: *AppState, key: u8, allocator: std.mem.Allocator, stdin: s
         },
 
         'f' => {
-            if (state.mode == .rectangle and state.rect_start_x != null) {
-                const x = @min(state.rect_start_x.?, state.cursor_x);
-                const y = @min(state.rect_start_y.?, state.cursor_y);
-                const w = @abs(@as(isize, @intCast(state.cursor_x)) - @as(isize, @intCast(state.rect_start_x.?))) + 1;
-                const h = @abs(@as(isize, @intCast(state.cursor_y)) - @as(isize, @intCast(state.rect_start_y.?))) + 1;
-                try pushUndoCopy(state, allocator);
-                state.canvas.drawRectangle(x, y, @intCast(w), @intCast(h), state.color, true);
-                state.rect_start_x = null;
-                state.rect_start_y = null;
+            if (state.mode == .rectangle) {
+                if (currentSelectionRect(state)) |rect| {
+                    try pushUndoCopy(state, allocator);
+                    state.canvas.drawRectangle(rect.x, rect.y, rect.w, rect.h, state.color, true);
+                    state.rect_start_x = null;
+                    state.rect_start_y = null;
+                }
+            }
+        },
+
+        't' => {
+            if (state.mode == .rectangle) {
+                if (currentSelectionRect(state)) |rect| {
+                    if (state.animation.frame_count > 1) {
+                        try cropAnimationFrames(state, allocator, rect);
+                        clearHistory(state);
+                    } else {
+                        try pushUndoCopy(state, allocator);
+                        const cropped = try state.canvas.crop(allocator, rect.x, rect.y, rect.w, rect.h);
+                        state.canvas.deinit();
+                        state.canvas = cropped;
+                    }
+                    clearSelection(state);
+                    clampCursor(state);
+                }
             }
         },
 
@@ -1579,11 +1677,7 @@ fn handleInput(state: *AppState, key: u8, allocator: std.mem.Allocator, stdin: s
                 .animation => .pen,
                 .quit => .pen,
             };
-            // Reset any in-progress operations
-            state.line_start_x = null;
-            state.line_start_y = null;
-            state.rect_start_x = null;
-            state.rect_start_y = null;
+            clearSelection(state);
         },
 
         // Color switching
@@ -2068,4 +2162,87 @@ test "PNG unfilter supports Sub and Paeth filters" {
     const paeth_pixels = try unfilterPngScanlines(allocator, 3, 2, 1, &paeth_filtered);
     defer allocator.free(paeth_pixels);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 20, 30, 15, 25, 35 }, paeth_pixels);
+}
+
+test "Canvas crop keeps the selected region" {
+    const allocator = std.testing.allocator;
+    var canvas = try Canvas.init(allocator, 4, 3);
+    defer canvas.deinit();
+
+    canvas.setPixel(1, 1, .black);
+    canvas.setPixel(2, 1, .black);
+    canvas.setPixel(2, 2, .black);
+
+    var cropped = try canvas.crop(allocator, 1, 1, 2, 2);
+    defer cropped.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), cropped.width);
+    try std.testing.expectEqual(@as(usize, 2), cropped.height);
+    try std.testing.expectEqual(Color.black, cropped.pixels[0][0]);
+    try std.testing.expectEqual(Color.black, cropped.pixels[0][1]);
+    try std.testing.expectEqual(Color.white, cropped.pixels[1][0]);
+    try std.testing.expectEqual(Color.black, cropped.pixels[1][1]);
+}
+
+test "currentSelectionRect returns inclusive bounds" {
+    var state = AppState{
+        .canvas = undefined,
+        .cursor_x = 4,
+        .cursor_y = 5,
+        .original_termios = undefined,
+        .animation = undefined,
+        .undo_stack = &.{},
+        .redo_stack = &.{},
+    };
+    state.rect_start_x = 2;
+    state.rect_start_y = 3;
+
+    const rect = currentSelectionRect(&state).?;
+    try std.testing.expectEqual(@as(usize, 2), rect.x);
+    try std.testing.expectEqual(@as(usize, 3), rect.y);
+    try std.testing.expectEqual(@as(usize, 3), rect.w);
+    try std.testing.expectEqual(@as(usize, 3), rect.h);
+}
+
+test "cropAnimationFrames crops every frame to the same size" {
+    const allocator = std.testing.allocator;
+
+    var animation = try AnimationState.init(allocator);
+    defer animation.deinit(allocator);
+
+    animation.frame_count = 2;
+    animation.current_frame = 0;
+    animation.frames[0] = try Canvas.init(allocator, 4, 4);
+    animation.frames[1] = try Canvas.init(allocator, 4, 4);
+    defer {
+        for (0..animation.frame_count) |idx| {
+            animation.frames[idx].deinit();
+        }
+    }
+
+    animation.frames[0].setPixel(1, 1, .black);
+    animation.frames[1].setPixel(2, 2, .black);
+
+    const undo_stack = try allocator.alloc(Canvas, 1);
+    defer allocator.free(undo_stack);
+    const redo_stack = try allocator.alloc(Canvas, 1);
+    defer allocator.free(redo_stack);
+
+    var state = AppState{
+        .canvas = try animation.frames[0].copy(allocator),
+        .original_termios = undefined,
+        .animation = animation,
+        .undo_stack = undo_stack,
+        .redo_stack = redo_stack,
+    };
+    defer state.canvas.deinit();
+
+    try cropAnimationFrames(&state, allocator, .{ .x = 1, .y = 1, .w = 2, .h = 2 });
+
+    try std.testing.expectEqual(@as(usize, 2), state.canvas.width);
+    try std.testing.expectEqual(@as(usize, 2), state.canvas.height);
+    try std.testing.expectEqual(@as(usize, 2), state.animation.frames[0].width);
+    try std.testing.expectEqual(@as(usize, 2), state.animation.frames[1].width);
+    try std.testing.expectEqual(Color.black, state.animation.frames[0].pixels[0][0]);
+    try std.testing.expectEqual(Color.black, state.animation.frames[1].pixels[1][1]);
 }

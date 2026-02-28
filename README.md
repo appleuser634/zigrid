@@ -80,6 +80,7 @@ Notes:
 - `m`: cycle mode `pen -> line -> rectangle -> fill -> animation`
 - `c`: toggle color `black/white`
 - `C`: clear canvas
+- `t`: crop the current rectangle selection
 - `u`: undo
 - `r`: redo
 
@@ -87,6 +88,8 @@ Notes:
 
 - `space`: choose first corner, then second corner
 - `f`: draw a filled rectangle after selecting corners
+- `t`: crop to the selected rectangle
+- if the animation has multiple frames, `t` crops all frames to the same rectangle
 
 ### File Operations
 
@@ -131,8 +134,9 @@ Inside the app:
 1. Press `m` until animation mode is active
 2. Create frames with `n`
 3. Move between frames with `[` and `]`
-4. Save the editable animation with `a`
-5. Export the animation with `A`, `S`, or `Z`
+4. Switch to rectangle mode if you want to crop, then use `space` + `t`
+5. Save the editable animation with `a`
+6. Export the animation with `A`, `S`, or `Z`
 
 ## Non-Interactive Export
 
